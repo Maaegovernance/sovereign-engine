@@ -1,11 +1,24 @@
-"""Semantic Policy Evaluation with Cryptographic Signature Verification and Ledger Auditing."""
+"""Semantic Policy Evaluation with Identity-Bound Council Signatures and Ledger Auditing.
 
-import hmac
-import hashlib
+Gate 3 of the Sovereign Engine pipeline:
+  - Central invariant (alignment ≥ base threshold)
+  - Policy-specific metric thresholds
+  - Identity-bound M-of-N council signatures via CouncilRegistry
+  - Cooldown / anti-flapping
+  - Immutable ledger audit of every decision
+"""
+
 import time
 from typing import Dict, Any, Tuple, Optional, List
-from policy import PolicyRegistry, ObjectiveClass, EscalationLevel
+from policy import PolicyRegistry, EscalationLevel
 from ledger_server import LedgerServer
+
+try:
+    from council import CouncilRegistry
+    _HAS_COUNCIL = True
+except ImportError:
+    _HAS_COUNCIL = False
+    CouncilRegistry = None  # type: ignore
 
 
 class PolicyEvaluator:
@@ -13,41 +26,34 @@ class PolicyEvaluator:
         self,
         registry: PolicyRegistry,
         ledger: LedgerServer,
-        shared_secret: bytes,
-        base_alignment_threshold: float = 0.31
+        base_alignment_threshold: float = 0.31,
+        council_registry: Optional["CouncilRegistry"] = None,
+        # retained for backward-compatible single-secret mode (deprecated)
+        shared_secret: Optional[bytes] = None,
     ):
         self.registry = registry
         self.ledger = ledger
-        self.shared_secret = shared_secret
         self.base_alignment_threshold = base_alignment_threshold
+        self.council_registry = council_registry
+        self.shared_secret = shared_secret  # only used if no council_registry
         self.last_execution_timestamps: Dict[str, float] = {}
-
-    def verify_hmac_signature(self, payload_str: str, signature_hex: str) -> bool:
-        """Verifies HMAC-SHA256 signature authenticity over payload."""
-        if not signature_hex or not isinstance(signature_hex, str):
-            return False
-        expected_hmac = hmac.new(
-            self.shared_secret,
-            payload_str.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(expected_hmac, signature_hex)
 
     def evaluate_command(
         self,
         policy_id: str,
         current_alignment: float,
         current_trust: float,
+        requestor_id: str = "system",
+        signature_map: Optional[Dict[str, str]] = None,
+        # backward-compat alias
         human_signatures: Optional[List[str]] = None,
-        requestor_id: str = "system"
     ) -> Tuple[bool, str, EscalationLevel]:
-        """
-        Evaluates command semantics against Central Invariant + Policy Rules.
+        """Evaluate a command against invariant + policy + identity-bound council signatures.
 
-        Data Provenance Note:
-        `current_trust` is sourced directly from GovernanceEngine via ConsensusEngine.
+        Preferred path: pass signature_map = {member_id: hmac_hex} together with a
+        CouncilRegistry attached at construction time.
         """
-        signatures = human_signatures or []
+        signature_map = signature_map or {}
         decision = False
         reason = ""
         escalation_level = EscalationLevel.HARD_VETO_SYSTEM_HALT
@@ -55,7 +61,10 @@ class PolicyEvaluator:
         try:
             # 1. Hard Central Security Invariant Gate
             if current_alignment < self.base_alignment_threshold:
-                reason = f"HALT: Absolute alignment breach below {self.base_alignment_threshold} threshold."
+                reason = (
+                    f"HALT: Absolute alignment breach below "
+                    f"{self.base_alignment_threshold} threshold."
+                )
                 escalation_level = EscalationLevel.HARD_VETO_SYSTEM_HALT
                 return False, reason, escalation_level
 
@@ -78,40 +87,38 @@ class PolicyEvaluator:
             if current_alignment < policy.min_alignment_required:
                 reason = (
                     f"VETO: Alignment {current_alignment:.2f} insufficient for "
-                    f"{policy.objective_class.value} (requires {policy.min_alignment_required:.2f})."
+                    f"{policy.objective_class.value} "
+                    f"(requires {policy.min_alignment_required:.2f})."
                 )
                 return False, reason, escalation_level
 
             if current_trust < policy.min_trust_required:
                 reason = (
                     f"VETO: Trust {current_trust:.2f} insufficient for "
-                    f"{policy.objective_class.value} (requires {policy.min_trust_required:.2f})."
+                    f"{policy.objective_class.value} "
+                    f"(requires {policy.min_trust_required:.2f})."
                 )
                 return False, reason, escalation_level
 
-            # 4. Cryptographic Human-in-the-Loop (HITL) Gate
-            if policy.escalation_level in (
-                EscalationLevel.HUMAN_APPROVAL_REQUIRED,
-                EscalationLevel.MULTI_SIGN_HUMAN_REQUIRED,
-            ):
-                if len(signatures) < policy.required_signatures_count:
-                    reason = (
-                        f"ESCALATE: Action requires {policy.required_signatures_count} "
-                        f"signature(s), received {len(signatures)}."
-                    )
-                    return False, reason, escalation_level
-
+            # 4. Identity-bound Human-in-the-Loop Gate
+            if policy.required_signatures_count > 0:
                 payload_str = f"{policy_id}:{requestor_id}"
-                valid_sigs = sum(
-                    1 for sig in signatures
-                    if self.verify_hmac_signature(payload_str, sig)
-                )
 
-                if valid_sigs < policy.required_signatures_count:
-                    reason = (
-                        f"VETO: Invalid HMAC signature verification "
-                        f"({valid_sigs}/{policy.required_signatures_count} valid)."
+                if self.council_registry is not None and _HAS_COUNCIL:
+                    # Preferred path: identity-bound council verification
+                    success, valid_signers, council_reason = (
+                        self.council_registry.validate_multi_sig(
+                            payload_str=payload_str,
+                            signature_map=signature_map,
+                            required_count=policy.required_signatures_count,
+                        )
                     )
+                    if not success:
+                        reason = f"REJECTED_COUNCIL_QUORUM: {council_reason}"
+                        return False, reason, escalation_level
+                else:
+                    # No council registry → hard reject when signatures are required
+                    reason = "REJECTED_NO_COUNCIL_REGISTRY"
                     return False, reason, escalation_level
 
             self.last_execution_timestamps[policy_id] = now
@@ -120,7 +127,6 @@ class PolicyEvaluator:
             return True, reason, escalation_level
 
         finally:
-            # Always record the evaluation decision to the immutable ledger
             audit_payload = {
                 "event": "POLICY_EVALUATION",
                 "policy_id": policy_id,
@@ -130,6 +136,6 @@ class PolicyEvaluator:
                 "decision": decision,
                 "reason": reason,
                 "escalation_level": escalation_level.value,
-                "timestamp": time.time()
+                "timestamp": time.time(),
             }
             self.ledger.record_transition(audit_payload)

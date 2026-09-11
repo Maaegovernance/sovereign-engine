@@ -1,18 +1,17 @@
 """Consensus Engine — multi-node quorum coordination for Sovereign Engine.
 
-Implements a three-gate evaluation pipeline:
+Three-gate evaluation pipeline:
 
   Gate 1: Central Security Invariant (alignment ≥ 0.31) — enforced locally by each node
-  Gate 2: Distributed Quorum (N/2+1 online & authorized nodes)
-  Gate 3: Semantic Policy & Cryptographic HITL Evaluation (optional PolicyEvaluator)
+  Gate 2: Distributed Quorum (ceil(N * quorum_fraction) online & authorized nodes)
+  Gate 3: Semantic Policy + Identity-bound Council Multi-Sig (optional PolicyEvaluator)
 
-High-trust majorities cannot override low-alignment states.
+Approved actions can be ordered by PriorityResolver before actuation.
 """
 
 from typing import List, Dict, Any, Optional
 from network_node import NetworkNode
 
-# Optional import — keeps backward compatibility if policy layer is not present
 try:
     from evaluator import PolicyEvaluator
     from policy import EscalationLevel
@@ -21,6 +20,13 @@ except ImportError:
     _HAS_POLICY = False
     PolicyEvaluator = None  # type: ignore
     EscalationLevel = None  # type: ignore
+
+try:
+    from priority import PriorityResolver
+    _HAS_PRIORITY = True
+except ImportError:
+    _HAS_PRIORITY = False
+    PriorityResolver = None  # type: ignore
 
 
 class ConsensusEngine:
@@ -49,17 +55,12 @@ class ConsensusEngine:
         noise_level: float = 0.02,
         policy_id: Optional[str] = None,
         requestor_id: str = "system",
-        human_signatures: Optional[List[str]] = None,
+        signature_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Execute one full consensus round through the three-gate pipeline.
-
-        1. Every online node samples + evaluates locally (Gate 1).
-        2. Every online node votes on the proposal (Gate 2 — quorum).
-        3. If a PolicyEvaluator is attached and a policy_id is supplied,
-           run semantic + cryptographic evaluation (Gate 3).
-        """
+        """Execute one full consensus round through the three-gate pipeline."""
         self.round += 1
         online = self._online_nodes()
+        signature_map = signature_map or {}
 
         if len(online) < self.min_online:
             result = {
@@ -86,7 +87,7 @@ class ConsensusEngine:
             if vote["vote"] == "YES":
                 yes_votes += 1
 
-        required = max(1, int(len(online) * self.quorum_fraction + 0.999))  # ceil
+        required = max(1, int(len(online) * self.quorum_fraction + 0.999))
 
         if yes_votes < required:
             result = {
@@ -104,20 +105,19 @@ class ConsensusEngine:
             self.history.append(result)
             return result
 
-        # Quorum passed. Aggregate alignment / trust from YES voters for Gate 3.
+        # Aggregate metrics from YES voters for Gate 3
         yes_alignments = []
         yes_trusts = []
         for v in votes:
             if v["vote"] == "YES":
-                nid = v["node_id"]
-                st = local_states.get(nid, {})
+                st = local_states.get(v["node_id"], {})
                 yes_alignments.append(st.get("alignment", 0.0))
                 yes_trusts.append(st.get("trust", 0.0))
 
         agg_alignment = sum(yes_alignments) / len(yes_alignments) if yes_alignments else 0.0
         agg_trust = sum(yes_trusts) / len(yes_trusts) if yes_trusts else 0.0
 
-        # --- Gate 3 (optional semantic policy) --------------------------------
+        # --- Gate 3 (optional semantic + council policy) ---------------------
         policy_result = None
         if (
             self.policy_evaluator is not None
@@ -128,8 +128,8 @@ class ConsensusEngine:
                 policy_id=policy_id,
                 current_alignment=agg_alignment,
                 current_trust=agg_trust,
-                human_signatures=human_signatures,
                 requestor_id=requestor_id,
+                signature_map=signature_map,
             )
             policy_result = {
                 "authorized": authorized,
@@ -155,7 +155,6 @@ class ConsensusEngine:
                 self.history.append(result)
                 return result
 
-        # All gates passed
         result = {
             "round": self.round,
             "decision": "ACCEPT",
@@ -175,11 +174,18 @@ class ConsensusEngine:
         self.history.append(result)
         return result
 
+    def resolve_priority_queue(
+        self, approved_commands: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Order a batch of already-authorized commands by PriorityResolver."""
+        if not _HAS_PRIORITY or PriorityResolver is None:
+            return approved_commands
+        return PriorityResolver.resolve_contention(approved_commands)
+
     def get_node(self, node_id: str) -> Optional[NetworkNode]:
         return self.nodes.get(node_id)
 
     def inject_fault(self, node_id: str, offline: bool = True) -> None:
-        """Simple fault injection: take a node offline."""
         node = self.nodes.get(node_id)
         if node:
             node.set_online(not offline)
